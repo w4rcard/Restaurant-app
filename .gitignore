@@ -1,0 +1,4 @@
+node_modules/
+dist/
+data/restaurante-v5.db-wal
+data/restaurante-v5.db-shm

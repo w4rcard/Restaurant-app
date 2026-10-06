@@ -1,0 +1,34 @@
+{
+  "name": "restaurante-v8",
+  "private": true,
+  "version": "0.8.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server/dev.mjs",
+    "dev": "node server/dev.mjs",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "server": "node server/index.mjs",
+    "dev:ui": "vite --host 127.0.0.1",
+    "test:smoke": "node tests/server-smoke.mjs",
+    "test:exhaustive": "node tests/v6-exhaustive.mjs",
+    "test:v7": "node tests/v7-regression.mjs",
+    "test:all": "node tests/v6-logic.mjs && node tests/v6-migration.mjs && node tests/v6-documents.mjs && node tests/v6-static.mjs && node tests/mixed-people.mjs && node tests/server-smoke.mjs && node tests/v6-exhaustive.mjs && node tests/v7-regression.mjs && node tests/v8-regression.mjs",
+    "test:v8": "node tests/v8-regression.mjs"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "vite": "^8.3.0"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}
