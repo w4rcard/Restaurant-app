@@ -254,7 +254,8 @@ await withDatabase(async database => {
 const diagnosticUrl = new URL(testUrl)
 diagnosticUrl.port = '1'
 await assert.rejects(runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: diagnosticUrl.toString() } }), error => {
-  assert.doesNotMatch(error.message, decodeURIComponent(diagnosticUrl.password || 'test_only_password'))
+  assert.equal(error.message.includes(decodeURIComponent(diagnosticUrl.password || 'test_only_password')), false,
+    'connection errors must not expose the configured password')
   return /psql termin[oó]|c[oó]digo/i.test(error.message)
 })
 await assert.rejects(runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: testUrl }, executable: 'pos-p2a-psql-missing' }), /No se pudo iniciar psql/)
@@ -262,7 +263,8 @@ await assert.rejects(runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_D
 const invalidCredentialUrl = new URL(testUrl)
 invalidCredentialUrl.password = `${invalidCredentialUrl.password}-invalid`
 await assert.rejects(runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: invalidCredentialUrl.toString() } }), error => {
-  assert.doesNotMatch(error.message, decodeURIComponent(invalidCredentialUrl.password))
+  assert.equal(error.message.includes(decodeURIComponent(invalidCredentialUrl.password)), false,
+    'authentication errors must not expose the attempted password')
   return /psql termin[oó]|c[oó]digo/i.test(error.message)
 })
 
