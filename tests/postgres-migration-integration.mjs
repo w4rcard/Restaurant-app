@@ -238,7 +238,7 @@ await withDatabase(async database => {
       await Promise.allSettled(runnerProcesses)
     }
   }
-  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '1')
+  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '2')
   assert.equal(await psql(database, "SELECT count(*) FROM pg_class WHERE relname = 'restaurants';"), '1')
 })
 
