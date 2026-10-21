@@ -25,7 +25,11 @@ export async function loadMigrations(directory = migrationDirectory) {
     if ((await lstat(filePath)).isSymbolicLink()) throw new Error(`No se aceptan enlaces simbólicos en migraciones: ${name}`)
     const sql = await readFile(filePath, 'utf8')
     if (!sql.trim() || /^\s*\\/m.test(sql)) throw new Error(`La migración ${name} está vacía o contiene comandos psql.`)
-    const executableSql = sql.replace(/'(?:''|[^'])*'/g, "''").replace(/--[^\r\n]*/g, '').replace(/\/(\*)[\s\S]*?\*(\/)/g, '')
+    const executableSql = sql
+      .replace(/(\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)[\s\S]*?\1/g, "''")
+      .replace(/'(?:''|[^'])*'/g, "''")
+      .replace(/--[^\r\n]*/g, '')
+      .replace(/\/(\*)[\s\S]*?\*(\/)/g, '')
     if (/(?:^|;)\s*(?:BEGIN(?:\s+TRANSACTION)?|START\s+TRANSACTION|COMMIT|ROLLBACK|ABORT)\b/im.test(executableSql)
       || /\b(?:VACUUM|ALTER\s+SYSTEM)\b|\b(?:CREATE|DROP)\s+DATABASE\b|\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b/i.test(executableSql)) {
       throw new Error(`La migración ${name} contiene una operación incompatible con la transacción única del runner.`)

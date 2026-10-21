@@ -11,8 +11,9 @@ import {
 } from '../server/postgres-migrate.mjs'
 
 const migrations = await loadMigrations()
-assert.equal(migrations.length, 1)
+assert.equal(migrations.length, 2)
 assert.equal(migrations[0].version, 1)
+assert.equal(migrations[1].version, 2)
 assert.match(migrations[0].checksum, /^[a-f0-9]{64}$/)
 
 const script = buildMigrationScript(migrations)
@@ -22,6 +23,7 @@ assert.match(script, /schema_migrations/)
 assert.match(script, /checksum/)
 assert.match(script, /COMMIT;/)
 assert.match(script, /\\if :migration_1_applied/)
+assert.match(script, /\\if :migration_2_applied/)
 assert.match(script, /unknown schema migration version/)
 assert.match(script, /incomplete migration history/)
 assert.match(script, /migration name\/checksum mismatch/)
@@ -42,6 +44,15 @@ for (const match of schema.matchAll(/REFERENCES ([a-z_]+)\s*\(/g)) {
 for (const match of schema.matchAll(/CREATE TABLE ([a-z_]+)\s*\(([\s\S]*?)\n\);/g)) {
   assert.match(match[2], /PRIMARY KEY/, `${match[1]} must have a primary key`)
 }
+
+const hardening = await readFile(new URL('../db/postgres/migrations/0002_schema_hardening.sql', import.meta.url), 'utf8')
+assert.match(hardening, /''NaN'', ''Infinity'', ''-Infinity''/)
+assert.match(hardening, /reject_immutable_record_mutation/)
+assert.match(hardening, /cash_sessions_closed_guard/)
+assert.match(hardening, /table_name \|\| '_append_only_guard'/)
+assert.match(hardening, /'sales', 'sale_orders', 'sale_lines'/)
+assert.doesNotMatch(hardening, /CREATE POLICY|ENABLE ROW LEVEL SECURITY/i,
+  'tenant RLS must remain deferred until a trusted tenant-context design exists')
 
 const secretUrl = 'postgresql://unit-user:do%40not-log@127.0.0.1:55432/isolated_test?sslmode=disable&application_name=schema-test'
 const target = parseMigrationTarget({ POSTGRES_MIGRATION_DATABASE_URL: secretUrl, PATH: 'test-path' })
@@ -71,6 +82,9 @@ try {
   await assert.rejects(loadMigrations(tempMigrations), /incompatible/)
   await writeFile(path.join(tempMigrations, '0001_first.sql'), 'CREATE INDEX CONCURRENTLY first_idx ON first_row (id);\n')
   await assert.rejects(loadMigrations(tempMigrations), /incompatible/)
+  await writeFile(path.join(tempMigrations, '0001_first.sql'), 'DO $body$ BEGIN NULL; END; $body$;\n')
+  assert.equal((await loadMigrations(tempMigrations)).length, 1,
+    'transaction-boundary validation must allow procedural BEGIN inside a dollar-quoted SQL body')
   await writeFile(path.join(tempMigrations, '0001_first.sql'), 'CREATE TABLE first_row (id text PRIMARY KEY);\n')
   await writeFile(path.join(tempMigrations, '0003_gap.sql'), 'SELECT 1;\n')
   await assert.rejects(loadMigrations(tempMigrations), /consecutivas/)

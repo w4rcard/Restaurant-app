@@ -29,8 +29,8 @@ function quoteIdentifier(value) {
   return `"${value.replaceAll('"', '""')}"`
 }
 
-function psql(database, sql, { expectFailure = false } = {}) {
-  const env = { ...pgAdminEnv, PGDATABASE: database }
+function psql(database, sql, { expectFailure = false, connectionUrl = testUrl } = {}) {
+  const env = { ...parseMigrationTarget({ POSTGRES_MIGRATION_DATABASE_URL: connectionUrl }).childEnv, PGDATABASE: database }
   return new Promise((resolve, reject) => {
     let stdout = ''
     let stderr = ''
@@ -92,6 +92,15 @@ async function withDatabase(callback) {
   try { return await callback(name) } finally { await dropDatabase(name) }
 }
 
+async function withTemporaryMigrations(callback) {
+  const { mkdtemp, mkdir, rm, copyFile, writeFile } = await import('node:fs/promises')
+  const os = await import('node:os')
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'pos-pg-migrations-'))
+  const directory = path.join(temp, 'migrations')
+  await mkdir(directory)
+  try { return await callback({ directory, copyFile, writeFile }) } finally { await rm(temp, { recursive: true, force: true }) }
+}
+
 function runRunner(database, { directory } = {}) {
   return runMigrations({
     env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) },
@@ -119,17 +128,31 @@ assert.match(await psql(adminDatabase, 'SHOW server_version_num;'), /^18\d{3,}$/
   'CI target must be PostgreSQL 18')
 
 await withDatabase(async database => {
+  await withTemporaryMigrations(async ({ directory, copyFile }) => {
+    const migrationOne = new URL('../db/postgres/migrations/0001_restaurant_core.sql', import.meta.url)
+    await copyFile(fileURLToPath(migrationOne), path.join(directory, '0001_restaurant_core.sql'))
+    assert.equal((await runRunner(database, { directory })).migrationCount, 1)
+    assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '1',
+      'the fixture must represent an existing schema version 0001 installation')
+    assert.equal((await runRunner(database)).migrationCount, 2)
+    assert.equal(await psql(database, 'SELECT string_agg(version::text, \'|\' ORDER BY version) FROM public.schema_migrations;'), '1|2',
+      'the normal runner must upgrade version 0001 to 0002')
+    assert.equal(await psql(database, "SELECT count(*) FROM pg_trigger WHERE tgname='sales_append_only_guard' AND NOT tgisinternal;"), '1')
+  })
+})
+
+await withDatabase(async database => {
   const first = await runRunner(database)
-  assert.equal(first.migrationCount, 1)
+  assert.equal(first.migrationCount, 2)
   const before = await psql(database, 'SELECT version || \'|\' || name || \'|\' || checksum FROM public.schema_migrations ORDER BY version;')
   const rerun = await runRunner(database)
-  assert.equal(rerun.migrationCount, 1)
+  assert.equal(rerun.migrationCount, 2)
   assert.equal(await psql(database, 'SELECT version || \'|\' || name || \'|\' || checksum FROM public.schema_migrations ORDER BY version;'), before,
     'rerunning must preserve migration version and checksum')
 
   await psql(database, "INSERT INTO public.schema_migrations(version,name,checksum) VALUES (9,'0099_unknown','" + '0'.repeat(64) + "');")
   await assert.rejects(runRunner(database), /unknown schema migration version/i)
-  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '2',
+  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '3',
     'unknown history must not alter previously recorded migration rows')
 })
 
@@ -171,17 +194,17 @@ await withDatabase(async database => {
 
 await withDatabase(async database => {
   const migrations = await import('../server/postgres-migrate.mjs')
-  const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises')
-  const os = await import('node:os')
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'pos-pg-rollback-'))
-  try {
-    const migrationDir = path.join(temp, 'migrations')
-    await mkdir(migrationDir)
-    await writeFile(path.join(migrationDir, '0001_fail.sql'), 'CREATE TABLE rollback_probe (id text PRIMARY KEY);\nSELECT 1 / 0;\n')
-    await assert.rejects(migrations.runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory: migrationDir }))
-    assert.equal(await psql(database, "SELECT count(*) FROM pg_class WHERE relname = 'rollback_probe';"), '0')
-    assert.equal(await psql(database, 'SELECT to_regclass(\'public.schema_migrations\') IS NULL;'), 't')
-  } finally { await rm(temp, { recursive: true, force: true }) }
+  await withTemporaryMigrations(async ({ directory, copyFile, writeFile }) => {
+    const migrationOne = new URL('../db/postgres/migrations/0001_restaurant_core.sql', import.meta.url)
+    await copyFile(fileURLToPath(migrationOne), path.join(directory, '0001_restaurant_core.sql'))
+    await runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory })
+    await writeFile(path.join(directory, '0002_deliberate_failure.sql'), 'CREATE TABLE rollback_probe (id text PRIMARY KEY);\nSELECT 1 / 0;\n')
+    await assert.rejects(migrations.runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory }))
+    assert.equal(await psql(database, "SELECT count(*) FROM pg_class WHERE relname = 'rollback_probe';"), '0',
+      'failed version 0002 must remove all objects created in its transaction')
+    assert.equal(await psql(database, 'SELECT string_agg(version::text, \'|\' ORDER BY version) FROM public.schema_migrations;'), '1',
+      'failed version 0002 must preserve version 0001 history without recording version 0002')
+  })
 })
 
 await withDatabase(async database => {
@@ -229,6 +252,10 @@ await withDatabase(async database => {
     INSERT INTO categories(restaurant_id,id,name) VALUES ('legacy:restaurant','cat:1','Bebidas'), ('2002','cat:1','Bebidas'), ('2002','only-second','Solo segundo');
     INSERT INTO products(restaurant_id,id,category_id,name,price,estimated_prep_seconds)
       VALUES ('legacy:restaurant','01','cat:1','Agua',123456789.123456789,0), ('2002','01','cat:1','Agua',0.000000001,0);
+    INSERT INTO restaurant_tables(restaurant_id,id,name,shape,x,y,seats)
+      VALUES ('2002','table-b','Mesa B','round',0,0,2);
+    INSERT INTO ingredients(restaurant_id,id,name,stock_unit)
+      VALUES ('legacy:restaurant','ingredient-a','Sal','g'), ('2002','ingredient-b','Sal','g');
   `
   await psql(database, setup)
   assert.equal(await psql(database, "SELECT price::text FROM products WHERE restaurant_id='legacy:restaurant' AND id='01';"), '123456789.123456789')
@@ -238,17 +265,86 @@ await withDatabase(async database => {
   assert.equal(await psql(database, "SELECT subtotal::text || '|' || discount::text || '|' || net_total::text || '|' || tip::text || '|' || total::text FROM sales WHERE restaurant_id='legacy:restaurant' AND id='sale:1';"),
     '123456789.123456789|0.000000001|123456789.123456788|0.01|123456789.133456788')
   await psql(database, "INSERT INTO products(restaurant_id,id,category_id,name,price,estimated_prep_seconds) VALUES ('legacy:restaurant','cross','only-second','Invalid',1,0);", { expectFailure: true })
+  await psql(database, `INSERT INTO orders(restaurant_id,id,order_number,order_type,status,table_id,table_name_snapshot,created_at,updated_at)
+    VALUES ('legacy:restaurant','cross-order',1,'mesa','PENDIENTE','table-b','Mesa B',now(),now());`, { expectFailure: true })
+  await psql(database, `INSERT INTO inventory_balances(restaurant_id,ingredient_id,quantity)
+    VALUES ('legacy:restaurant','ingredient-b',1);`, { expectFailure: true })
   await psql(database, "INSERT INTO products(restaurant_id,id,category_id,name,price,estimated_prep_seconds) VALUES ('legacy:restaurant','cross','cat:1','Invalid',-1,0);", { expectFailure: true })
+  for (const special of ['NaN', 'Infinity', '-Infinity']) {
+    await psql(database, `INSERT INTO products(restaurant_id,id,category_id,name,price,estimated_prep_seconds)
+      VALUES ('legacy:restaurant','special-${special.replaceAll('-', 'minus')}','cat:1','Invalid','${special}'::numeric,0);`, { expectFailure: true })
+    await psql(database, `INSERT INTO sales(restaurant_id,id,currency_code,subtotal,discount,net_total,tip,total,payment_method,people,order_type,created_at)
+      VALUES ('legacy:restaurant','special-sale-${special.replaceAll('-', 'minus')}','COP','${special}'::numeric,0,0,0,0,'cash',1,'pickup',now());`, { expectFailure: true })
+  }
+  await psql(database, `INSERT INTO products(restaurant_id,id,category_id,name,price,estimated_prep_seconds)
+    VALUES ('legacy:restaurant','boundary-zero','cat:1','Zero',0,0);`)
   await psql(database, "INSERT INTO employees(restaurant_id,id,name,role) VALUES ('legacy:restaurant','bad','X','Root');", { expectFailure: true })
   await psql(database, "INSERT INTO categories(restaurant_id,id,name) VALUES ('legacy:restaurant','cat:dup','Bebidas');", { expectFailure: true })
   assert.equal(await psql(database, "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('employee_credentials','employee_sessions','restaurants');"), '3')
   assert.equal(await psql(database, "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='application_state';"), '0')
   assert.equal(await psql(database, "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='employees' AND column_name IN ('scheme','salt','password_hash','credential_state');"), '0')
+  assert.equal(await psql(database, "INSERT INTO inventory_balances(restaurant_id,ingredient_id,quantity) VALUES ('legacy:restaurant','ingredient-a',0); SELECT quantity::text FROM inventory_balances WHERE restaurant_id='legacy:restaurant' AND ingredient_id='ingredient-a';"), '0',
+    'zero inventory is a valid boundary value')
+  await psql(database, `INSERT INTO inventory_movements(restaurant_id,id,ingredient_id,movement_type,quantity_delta,unit,reason)
+    VALUES ('legacy:restaurant','negative-adjustment','ingredient-a','adjustment',-1,'g','Correction');`)
 })
 
 await withDatabase(async database => {
   const { database: dbName } = await runRunner(database)
   assert.equal(dbName, database)
+})
+
+await withDatabase(async database => {
+  await runRunner(database)
+  const roleName = `pos_p2a_runtime_test_${randomUUID().replaceAll('-', '').slice(0, 12)}`
+  const password = randomUUID().replaceAll('-', '')
+  const runtimeUrl = new URL(urlFor(database))
+  runtimeUrl.username = roleName
+  runtimeUrl.password = password
+  const role = quoteIdentifier(roleName)
+  await psql(database, `
+    INSERT INTO restaurants(id,name,currency_code) VALUES ('runtime-test','Runtime test','COP');
+    INSERT INTO employees(restaurant_id,id,name,role) VALUES ('runtime-test','cashier','Test cashier','Caja');
+    INSERT INTO sales(restaurant_id,id,currency_code,subtotal,discount,net_total,tip,total,payment_method,people,employee_id,order_type,created_at)
+      VALUES ('runtime-test','sale-1','COP',100,0,100,0,100,'efectivo',1,'cashier','pickup',now());
+    INSERT INTO cash_sessions(restaurant_id,id,opened_by,opened_at,opening_amount,closed_by,closed_at,expected_amount,counted_amount,difference)
+      VALUES ('runtime-test','closed-session','cashier',now(),100,'cashier',now(),100,101,1);
+    CREATE ROLE ${role} LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+    GRANT CONNECT ON DATABASE ${quoteIdentifier(database)} TO ${role};
+    GRANT USAGE ON SCHEMA public TO ${role};
+    GRANT SELECT ON employees, sales TO ${role};
+    GRANT INSERT, SELECT ON sale_adjustments TO ${role};
+    GRANT SELECT, INSERT, UPDATE ON payment_attempts TO ${role};
+    INSERT INTO payment_attempts(restaurant_id,id,sale_id,payment_method,amount,status,employee_id)
+      VALUES ('runtime-test','attempt-1','sale-1','card',100,'pending','cashier');
+  `)
+
+  assert.equal(await psql(database, 'SELECT current_user;', { connectionUrl: runtimeUrl.toString() }), roleName,
+    'history privilege checks must run as a distinct non-owner runtime role')
+  await psql(database, `INSERT INTO sale_adjustments(restaurant_id,id,sale_id,amount_delta,reason,employee_id)
+    VALUES ('runtime-test','correction-1','sale-1',-1,'Approved correction','cashier');`, { connectionUrl: runtimeUrl.toString() })
+  await psql(database, "UPDATE payment_attempts SET status='succeeded',completed_at=now() WHERE restaurant_id='runtime-test' AND id='attempt-1';", { connectionUrl: runtimeUrl.toString() })
+  assert.equal(await psql(database, "SELECT status FROM payment_attempts WHERE restaurant_id='runtime-test' AND id='attempt-1';", { connectionUrl: runtimeUrl.toString() }), 'succeeded',
+    'pending payment attempts must retain their supported lifecycle updates')
+  for (const sql of [
+    "UPDATE sales SET total=0 WHERE restaurant_id='runtime-test' AND id='sale-1';",
+    "DELETE FROM sales WHERE restaurant_id='runtime-test' AND id='sale-1';",
+    "UPDATE sale_adjustments SET amount_delta=1 WHERE restaurant_id='runtime-test' AND id='correction-1';",
+    "DELETE FROM sale_adjustments WHERE restaurant_id='runtime-test' AND id='correction-1';",
+  ]) await psql(database, sql, { expectFailure: true })
+  for (const sql of [
+    "UPDATE sales SET total=0 WHERE restaurant_id='runtime-test' AND id='sale-1';",
+    "DELETE FROM sales WHERE restaurant_id='runtime-test' AND id='sale-1';",
+    "UPDATE sale_adjustments SET amount_delta=1 WHERE restaurant_id='runtime-test' AND id='correction-1';",
+    "DELETE FROM sale_adjustments WHERE restaurant_id='runtime-test' AND id='correction-1';",
+  ]) await psql(database, sql, { expectFailure: true, connectionUrl: runtimeUrl.toString() })
+  assert.equal(await psql(database, "SELECT count(*) FROM pg_trigger WHERE tgname IN ('sales_append_only_guard','sale_adjustments_append_only_guard') AND NOT tgisinternal;"), '2',
+    'append-only triggers must protect completed sales and correction records')
+  assert.equal(await psql(database, "SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('public.payment_attempts'::regclass,'public.outbox_events'::regclass) AND NOT tgisinternal;"), '0',
+    'mutable processing tables must not receive append-only triggers')
+  await psql(database, "UPDATE cash_sessions SET counted_amount=102,difference=2 WHERE restaurant_id='runtime-test' AND id='closed-session';", { expectFailure: true })
+  await psql(database, "DELETE FROM cash_sessions WHERE restaurant_id='runtime-test' AND id='closed-session';", { expectFailure: true })
+  await psql(database, `DROP OWNED BY ${role}; DROP ROLE ${role};`)
 })
 
 const diagnosticUrl = new URL(testUrl)
