@@ -128,7 +128,9 @@ await withDatabase(async database => {
     'rerunning must preserve migration version and checksum')
 
   await psql(database, "INSERT INTO public.schema_migrations(version,name,checksum) VALUES (9,'0099_unknown','" + '0'.repeat(64) + "');")
-  await assert.rejects(runRunner(database), /versi[oó]n|migraci[oó]n/i)
+  await assert.rejects(runRunner(database), /unknown schema migration version/i)
+  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '2',
+    'unknown history must not alter previously recorded migration rows')
 })
 
 await withDatabase(async database => {
@@ -144,7 +146,9 @@ await withDatabase(async database => {
       version integer PRIMARY KEY CHECK (version > 0), name text NOT NULL UNIQUE,
       checksum char(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), applied_at timestamptz NOT NULL DEFAULT now()
     ); INSERT INTO public.schema_migrations(version,name,checksum) VALUES (2,'0002_second.sql','${'0'.repeat(64)}');`)
-    await assert.rejects(runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory: migrationDir }), /faltantes|huecos|historial/i)
+    await assert.rejects(runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory: migrationDir }), /incomplete migration history/i)
+    assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '1')
+    assert.equal(await psql(database, "SELECT to_regclass('public.first_probe') IS NULL;"), 't')
   } finally { await rm(temp, { recursive: true, force: true }) }
 })
 
@@ -159,7 +163,9 @@ await withDatabase(async database => {
     await writeFile(path.join(migrationDir, '0001_first.sql'), 'CREATE TABLE checksum_probe (id text PRIMARY KEY);\n')
     await migrations.runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory: migrationDir })
     await writeFile(path.join(migrationDir, '0001_first.sql'), 'CREATE TABLE checksum_probe (id text PRIMARY KEY, note text);\n')
-    await assert.rejects(migrations.runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory: migrationDir }), /checksum|nombre/i)
+    await assert.rejects(migrations.runMigrations({ env: { ...process.env, POSTGRES_MIGRATION_DATABASE_URL: urlFor(database) }, directory: migrationDir }), /migration name\/checksum mismatch/i)
+    assert.equal(await psql(database, "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='checksum_probe';"), '1',
+      'checksum mismatch must not alter the applied schema')
   } finally { await rm(temp, { recursive: true, force: true }) }
 })
 

@@ -99,20 +99,24 @@ export function buildMigrationScript(migrations) {
       checksum char(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'),
       applied_at timestamptz NOT NULL DEFAULT now()
     );`,
-    `SELECT CASE WHEN EXISTS (SELECT 1 FROM public.schema_migrations WHERE NOT (version = ANY(${expectedVersions}))) THEN 'true' ELSE 'false' END AS unknown_state \\gset`,
-    '\\if :unknown_state',
-    "\\echo ERROR: la base contiene versiones de migración desconocidas.",
-    '\\quit 3',
-    '\\endif',
-    `SELECT CASE WHEN EXISTS (
-      SELECT 1 FROM generate_series(1, ${versions.length}) AS expected(version)
-      WHERE NOT EXISTS (SELECT 1 FROM public.schema_migrations AS applied WHERE applied.version = expected.version)
-        AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version > expected.version)
-    ) THEN 'true' ELSE 'false' END AS migration_gap \\gset`,
-    '\\if :migration_gap',
-    "\\echo ERROR: el historial de migración tiene versiones faltantes.",
-    '\\quit 3',
-    '\\endif',
+    `DO $migration_history_guard$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM public.schema_migrations WHERE NOT (version = ANY(${expectedVersions}))) THEN
+        RAISE EXCEPTION 'unknown schema migration version';
+      END IF;
+    END
+    $migration_history_guard$;`,
+    `DO $migration_gap_guard$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM generate_series(1, ${versions.length}) AS expected(version)
+        WHERE NOT EXISTS (SELECT 1 FROM public.schema_migrations AS applied WHERE applied.version = expected.version)
+          AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version > expected.version)
+      ) THEN
+        RAISE EXCEPTION 'incomplete migration history: gap found';
+      END IF;
+    END
+    $migration_gap_guard$;`,
   ]
 
   for (const migration of migrations) {
@@ -120,17 +124,18 @@ export function buildMigrationScript(migrations) {
     lines.push(
       `SELECT CASE WHEN EXISTS (SELECT 1 FROM public.schema_migrations WHERE version = ${migration.version}) THEN 'true' ELSE 'false' END AS applied \\gset ${prefix}_`,
       `\\if :${prefix}_applied`,
-      `SELECT CASE WHEN EXISTS (SELECT 1 FROM public.schema_migrations WHERE version = ${migration.version} AND name = ${quoteLiteral(migration.name)} AND checksum = ${quoteLiteral(migration.checksum)}) THEN 'true' ELSE 'false' END AS matches \\gset ${prefix}_`,
-      `\\if :${prefix}_matches`,
-      `\\echo Migración ${migration.version} ya aplicada; checksum verificado.`,
-      '\\else',
-      `\\echo ERROR: cambió el nombre o checksum de la migración ${migration.version}.`,
-      '\\quit 4',
-      '\\endif',
+      `DO $migration_checksum_guard$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE version = ${migration.version} AND name = ${quoteLiteral(migration.name)} AND checksum = ${quoteLiteral(migration.checksum)}) THEN
+          RAISE EXCEPTION 'migration name/checksum mismatch at version %', ${migration.version};
+        END IF;
+      END
+      $migration_checksum_guard$;`,
+      `\\echo Migration ${migration.version} already applied; checksum verified.`,
       '\\else',
       migration.sql,
       `INSERT INTO public.schema_migrations (version, name, checksum) VALUES (${migration.version}, ${quoteLiteral(migration.name)}, ${quoteLiteral(migration.checksum)});`,
-      `\\echo Migración ${migration.version} aplicada.`,
+      `\\echo Migration ${migration.version} applied.`,
       '\\endif',
     )
   }
