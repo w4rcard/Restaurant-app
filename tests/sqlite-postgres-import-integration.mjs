@@ -87,7 +87,7 @@ try{
   assert.equal((await query(target.url,"SELECT sum(amount)::text AS total FROM payments WHERE restaurant_id=$1 AND sale_id='sale-A'",['restaurant-p3-test'])).rows[0].total,'9.6')
   assert.equal((await query(target.url,"SELECT status FROM legacy_import_runs WHERE restaurant_id=$1",['restaurant-p3-test'])).rows[0].status,'completed')
   const manifestCounts=(await query(target.url,"SELECT imported_counts FROM legacy_import_runs WHERE restaurant_id=$1",['restaurant-p3-test'])).rows[0].imported_counts
-  for(const table of insertOrder){const actual=Number((await query(target.url,`SELECT count(*)::int AS n FROM public."${table}" WHERE restaurant_id=$1`,['restaurant-p3-test'])).rows[0].n);assert.equal(actual,Number(manifestCounts[table]||0),`committed target count for ${table} must match the accepted import manifest`)}
+  for(const table of insertOrder){const tenantColumn=table==='restaurants'?'id':'restaurant_id';const actual=Number((await query(target.url,`SELECT count(*)::int AS n FROM public."${table}" WHERE "${tenantColumn}"=$1`,['restaurant-p3-test'])).rows[0].n);assert.equal(actual,Number(manifestCounts[table]||0),`committed target count for ${table} must match the accepted import manifest`)}
   assert.equal((await query(target.url,"SELECT count(*)::int AS n FROM audit_events WHERE details->>'provenance'='legacy_unverified'")).rows[0].n,1)
   const reportText=fs.readFileSync(source.reportPath,'utf8')
   assert.doesNotMatch(reportText,/12345678|password_hash|salt|Synthetic Customer|fixture@example/)
