@@ -17,11 +17,14 @@
     "test:exhaustive": "node tests/v6-exhaustive.mjs",
     "test:v7": "node tests/v7-regression.mjs",
     "test:all": "node tests/v6-logic.mjs && node tests/v6-migration.mjs && node tests/v6-documents.mjs && node tests/v6-static.mjs && node tests/mixed-people.mjs && node tests/server-smoke.mjs && node tests/v6-exhaustive.mjs && node tests/v7-regression.mjs && node tests/v8-regression.mjs",
-    "test:v8": "node tests/v8-regression.mjs"
+    "test:v8": "node tests/v8-regression.mjs",
+    "test:sqlite-pg-import-unit": "node tests/sqlite-postgres-import-unit.mjs",
+    "test:sqlite-pg-import-integration": "node tests/sqlite-postgres-import-integration.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "pg": "^8.16.3"
   },
   "devDependencies": {
     "@types/react": "^19.2.18",

@@ -11,9 +11,10 @@ import {
 } from '../server/postgres-migrate.mjs'
 
 const migrations = await loadMigrations()
-assert.equal(migrations.length, 2)
+assert.equal(migrations.length, 3)
 assert.equal(migrations[0].version, 1)
 assert.equal(migrations[1].version, 2)
+assert.equal(migrations[2].version, 3)
 assert.match(migrations[0].checksum, /^[a-f0-9]{64}$/)
 
 const script = buildMigrationScript(migrations)
@@ -51,6 +52,9 @@ assert.match(hardening, /reject_immutable_record_mutation/)
 assert.match(hardening, /cash_sessions_closed_guard/)
 assert.match(hardening, /table_name \|\| '_append_only_guard'/)
 assert.match(hardening, /'sales', 'sale_orders', 'sale_lines'/)
+const importerMigration = await readFile(new URL('../db/postgres/migrations/0003_legacy_import_manifest.sql', import.meta.url), 'utf8')
+assert.match(importerMigration, /legacy_import_entity_map/)
+assert.match(importerMigration, /status IN \('staging', 'completed'\)/)
 assert.doesNotMatch(hardening, /CREATE POLICY|ENABLE ROW LEVEL SECURITY/i,
   'tenant RLS must remain deferred until a trusted tenant-context design exists')
 

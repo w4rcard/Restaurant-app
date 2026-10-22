@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import {
+  loadMigrations,
   parseMigrationTarget,
   runMigrations,
 } from '../server/postgres-migrate.mjs'
@@ -23,6 +24,7 @@ if (!['postgres:', 'postgresql:'].includes(parsedAdmin.protocol)
 
 const pgAdminEnv = parseMigrationTarget({ POSTGRES_MIGRATION_DATABASE_URL: testUrl }).childEnv
 const runnerPath = fileURLToPath(new URL('../server/postgres-migrate.mjs', import.meta.url))
+const currentMigrationCount=(await loadMigrations()).length
 let databaseSequence = 0
 
 function quoteIdentifier(value) {
@@ -134,25 +136,25 @@ await withDatabase(async database => {
     assert.equal((await runRunner(database, { directory })).migrationCount, 1)
     assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '1',
       'the fixture must represent an existing schema version 0001 installation')
-    assert.equal((await runRunner(database)).migrationCount, 2)
-    assert.equal(await psql(database, 'SELECT string_agg(version::text, \'|\' ORDER BY version) FROM public.schema_migrations;'), '1|2',
-      'the normal runner must upgrade version 0001 to 0002')
+    assert.equal((await runRunner(database)).migrationCount, currentMigrationCount)
+    assert.equal(await psql(database, 'SELECT string_agg(version::text, \'|\' ORDER BY version) FROM public.schema_migrations;'), Array.from({length:currentMigrationCount},(_,index)=>String(index+1)).join('|'),
+      'the normal runner must upgrade version 0001 to all current migrations')
     assert.equal(await psql(database, "SELECT count(*) FROM pg_trigger WHERE tgname='sales_append_only_guard' AND NOT tgisinternal;"), '1')
   })
 })
 
 await withDatabase(async database => {
   const first = await runRunner(database)
-  assert.equal(first.migrationCount, 2)
+  assert.equal(first.migrationCount, currentMigrationCount)
   const before = await psql(database, 'SELECT version || \'|\' || name || \'|\' || checksum FROM public.schema_migrations ORDER BY version;')
   const rerun = await runRunner(database)
-  assert.equal(rerun.migrationCount, 2)
+  assert.equal(rerun.migrationCount, currentMigrationCount)
   assert.equal(await psql(database, 'SELECT version || \'|\' || name || \'|\' || checksum FROM public.schema_migrations ORDER BY version;'), before,
     'rerunning must preserve migration version and checksum')
 
   await psql(database, "INSERT INTO public.schema_migrations(version,name,checksum) VALUES (9,'0099_unknown','" + '0'.repeat(64) + "');")
   await assert.rejects(runRunner(database), /unknown schema migration version/i)
-  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '3',
+  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), String(currentMigrationCount + 1),
     'unknown history must not alter previously recorded migration rows')
 })
 
@@ -238,7 +240,7 @@ await withDatabase(async database => {
       await Promise.allSettled(runnerProcesses)
     }
   }
-  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), '2')
+  assert.equal(await psql(database, 'SELECT count(*) FROM public.schema_migrations;'), String(currentMigrationCount))
   assert.equal(await psql(database, "SELECT count(*) FROM pg_class WHERE relname = 'restaurants';"), '1')
 })
 

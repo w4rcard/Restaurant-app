@@ -3,7 +3,7 @@ name: PostgreSQL migration integration
 on:
   pull_request:
   push:
-    branches: [main, p2a-postgres-ci]
+    branches: [main, p2a-postgres-ci, p3-sqlite-postgres-importer]
   workflow_dispatch:
 
 permissions:
@@ -41,5 +41,9 @@ jobs:
           sudo apt-get install --yes --no-install-recommends postgresql-client
       - name: Install project dependencies
         run: npm ci
-      - name: Run PostgreSQL migration integration tests
+      - name: Run PostgreSQL schema integration tests
         run: npm run test:pg-migration-integration
+      - name: Run importer unit tests
+        run: npm run test:sqlite-pg-import-unit
+      - name: Run SQLite to PostgreSQL integration tests
+        run: npm run test:sqlite-pg-import-integration
