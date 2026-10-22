@@ -294,6 +294,46 @@ export function safeReport({ sourceSha256, restaurantId, validation, dryRun, imp
   }
 }
 
+const safeSqlIdentifier = value => typeof value === 'string' && /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.test(value) ? value : null
+export function classifyPostgresError(error, stage) {
+  const sqlstate = typeof error?.code === 'string' && /^[0-9A-Z]{5}$/.test(error.code) ? error.code : null
+  const codes = { '23505': 'postgres_unique_violation', '23503': 'postgres_foreign_key_violation', '23514': 'postgres_check_violation', '42601': 'postgres_syntax_error', '40001': 'postgres_serialization_failure' }
+  const diagnostic = {
+    code: sqlstate ? (codes[sqlstate] || 'postgres_sql_error') : 'postgres_operation_failed',
+    stage: safeSqlIdentifier(stage) || 'postgres_operation',
+  }
+  if (sqlstate) diagnostic.sqlstate = sqlstate
+  for (const key of ['constraint', 'table', 'column']) {
+    const value = safeSqlIdentifier(error?.[key])
+    if (value) diagnostic[key] = value
+  }
+  return diagnostic
+}
+
+export function validateRowMappings(built, requiredTables) {
+  if (!Array.isArray(requiredTables) || new Set(requiredTables).size !== requiredTables.length) {
+    throw Object.assign(new Error('invalid row mapping set'), { diagnostic: fail('invalid_row_mapping_set') })
+  }
+  for (const table of requiredTables) {
+    const mapping = built?.rows?.[table]
+    if (!mapping || !Array.isArray(mapping.cols) || mapping.cols.length === 0 || !Array.isArray(mapping.data)) {
+      throw Object.assign(new Error('invalid row mapping'), { diagnostic: fail('missing_or_invalid_row_mapping', table) })
+    }
+    for (const [index, row] of mapping.data.entries()) {
+      if (!Array.isArray(row) || row.length !== mapping.cols.length) {
+        throw Object.assign(new Error('row column arity mismatch'), { diagnostic: fail('row_column_arity_mismatch', table, index) })
+      }
+    }
+  }
+  if (Object.keys(built.rows).length !== requiredTables.length) {
+    throw Object.assign(new Error('unexpected row mapping'), { diagnostic: fail('invalid_row_mapping_set') })
+  }
+  if (!Array.isArray(built.idmap) || built.idmap.some(row => !Array.isArray(row) || row.length !== 5)) {
+    throw Object.assign(new Error('entity map arity mismatch'), { diagnostic: fail('entity_map_arity_mismatch', 'legacy_import_entity_map') })
+  }
+  return true
+}
+
 async function assertTargetReady(client) {
   const migrations = await loadMigrations()
   const applied = await client.query('SELECT version, name, checksum FROM public.schema_migrations ORDER BY version')
@@ -364,7 +404,7 @@ export function buildRows(restaurantId, state, credentials, validation, confirme
     for(const extraId of arr(p.extraIds))productModifiers.push([r,productId,String(extraId)])
   }
   array('products',['restaurant_id','id','category_id','name','description','price','active','image','estimated_prep_seconds'],entities('products').map(([id,p])=>{mapped('products',id);return[r,id,String(p.categoryId),String(p.name||'').trim(),String(p.description||''),numberValue(Number(p.price),'products',id,'price'),p.isActive!==false&&p.active!==false,String(p.image||''),seconds(p.estimatedPrepTime)]}))
-  array('product_recipe_versions',['restaurant_id','id','product_id','version'],recipes)
+  array('product_recipe_versions',['restaurant_id','id','product_id','version','created_by'],recipes)
   array('product_recipe_ingredients',['restaurant_id','recipe_version_id','ingredient_id','quantity','unit'],recipeIngredients)
   array('product_modifiers',['restaurant_id','product_id','modifier_id'],productModifiers)
 
@@ -421,16 +461,16 @@ export function buildRows(restaurantId, state, credentials, validation, confirme
   return {rows,idmap}
 }
 
-const insertOrder=['restaurants','employees','employee_credentials','restaurant_tables','table_groups','table_group_members','categories','ingredient_categories','ingredients','inventory_balances','modifier_categories','modifiers','modifier_ingredients','products','product_recipe_versions','product_recipe_ingredients','product_modifiers','customers','reservations','orders','order_lines','order_line_modifiers','sales','sale_orders','sale_lines','payments','sale_documents','inventory_movements','cash_sessions','cash_movements','audit_events']
+export const insertOrder=['restaurants','employees','employee_credentials','restaurant_tables','table_groups','table_group_members','categories','ingredient_categories','ingredients','inventory_balances','modifier_categories','modifiers','modifier_ingredients','products','product_recipe_versions','product_recipe_ingredients','product_modifiers','customers','reservations','orders','order_lines','order_line_modifiers','sales','sale_orders','sale_lines','payments','sale_documents','inventory_movements','cash_sessions','cash_movements','audit_events']
 
-export async function runSqlitePostgresImport({sourcePath,activePath,reportPath,restaurantId,dryRun=false,confirmedLegacySalesCurrency=null,connectionString=process.env.POSTGRES_IMPORT_DATABASE_URL,pgClient=Client}){
+export async function runSqlitePostgresImport({sourcePath,activePath,reportPath,restaurantId,dryRun=false,confirmedLegacySalesCurrency=null,connectionString=process.env.POSTGRES_IMPORT_DATABASE_URL,pgClient=Client,rowBuilder=buildRows}){
   const paths=validateImportPaths({sourcePath,activePath,reportPath})
   if(!restaurantId||typeof restaurantId!=='string'||restaurantId.trim()!==restaurantId)throw new Error('explicit_restaurant_id_required')
   const source=readSnapshot(paths.sourcePath)
   const digest=source.sourceSha256
   const validation=validateState(source.state,source.credentials,confirmedLegacySalesCurrency,source.numericPrecisionAmbiguous)
   let built=null
-  if(!validation.diagnostics.length){try{built=buildRows(restaurantId,source.state,source.credentials,validation,confirmedLegacySalesCurrency)}catch(error){if(error.diagnostic)validation.diagnostics.push(error.diagnostic);else throw error}}
+  if(!validation.diagnostics.length){try{built=rowBuilder(restaurantId,source.state,source.credentials,validation,confirmedLegacySalesCurrency);validateRowMappings(built,insertOrder)}catch(error){if(error.diagnostic)validation.diagnostics.push(error.diagnostic);else throw error}}
   const proposedCounts=built?Object.fromEntries([...Object.entries(built.rows).map(([table,entry])=>[table,entry.data.length]),['legacy_import_entity_map',built.idmap.length]]):{}
   let report=safeReport({sourceSha256:digest,restaurantId,validation,dryRun,confirmedLegacySalesCurrency,importedCounts:proposedCounts})
   if(validation.diagnostics.length){fs.writeFileSync(paths.reportPath,JSON.stringify(report,null,2),{mode:0o600});return report}
@@ -442,25 +482,34 @@ export async function runSqlitePostgresImport({sourcePath,activePath,reportPath,
   const client=new pgClient({connectionString,application_name:'pos-p3-sqlite-import',connectionTimeoutMillis:5000})
   const importId=randomUUID()
   let connected=false
+  let stage='connect'
   try{
     await client.connect();connected=true
+    stage='begin'
     await client.query(dryRun?'BEGIN READ ONLY':'BEGIN ISOLATION LEVEL SERIALIZABLE')
+    stage='lock'
     if(!dryRun)await client.query("SELECT pg_advisory_xact_lock(hashtext('pos-p3-import'),hashtext($1))",[restaurantId])
+    stage='target_check'
     await assertTargetReady(client)
     if(dryRun){await client.query('ROLLBACK');fs.writeFileSync(paths.reportPath,JSON.stringify(report,null,2),{mode:0o600});return report}
     const importedCounts={}
-    for(const table of insertOrder){const entry=built.rows[table];importedCounts[table]=await insert(client,table,entry.cols,entry.data)}
+    for(const table of insertOrder){stage=`insert_${table}`;const entry=built.rows[table];importedCounts[table]=await insert(client,table,entry.cols,entry.data)}
     importedCounts.cashMovements=importedCounts.cash_movements||0
+    stage='manifest'
     await client.query('INSERT INTO public.legacy_import_runs (restaurant_id,id,source_sha256,status,source_state_version,source_counts,imported_counts,relationship_counts,credential_state_counts,reconciliation) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb)',[restaurantId,importId,digest,'staging',source.sourceVersion,JSON.stringify(validation.counts),JSON.stringify(importedCounts),JSON.stringify({saleOrders:validation.claimedOrders.size,tableGroups:built.rows.table_groups.data.length}),JSON.stringify(validation.credentialStates),JSON.stringify({status:'staging',blockers:[],limitations:['legacy_audit_unverified','recipe_versions_for_historical_orders_not_reconstructed']})])
+    stage='entity_map'
     for(const [type,sourceId,targetId,generated] of built.idmap){await client.query('INSERT INTO public.legacy_import_entity_map (restaurant_id,import_id,entity_type,source_id,target_id,generated) VALUES ($1,$2,$3,$4,$5,$6)',[restaurantId,importId,type,sourceId,targetId,generated])}
+    stage='verify'
     const financialReconciliation=await verifyImportedTarget(client,restaurantId,built,source)
+    stage='complete'
     await client.query("UPDATE public.legacy_import_runs SET status='completed', reconciliation=$3::jsonb WHERE restaurant_id=$1 AND id=$2",[restaurantId,importId,JSON.stringify({status:'accepted',blockers:[],financialAggregates:financialReconciliation,limitations:['legacy_audit_unverified','recipe_versions_for_historical_orders_not_reconstructed']})])
+    stage='commit'
     await client.query('COMMIT')
     report=safeReport({sourceSha256:digest,restaurantId,validation,dryRun:false,importedCounts,confirmedLegacySalesCurrency})
     report.importId=importId
     fs.writeFileSync(paths.reportPath,JSON.stringify(report,null,2),{mode:0o600})
     return report
-  }catch(error){if(connected)try{await client.query('ROLLBACK')}catch{};const diagnostic=error.diagnostic||fail('postgres_import_failed');report=safeReport({sourceSha256:digest,restaurantId,validation:{...validation,diagnostics:[...validation.diagnostics,diagnostic]},dryRun,confirmedLegacySalesCurrency});writeReport();throw new Error(diagnostic.code)}
+  }catch(error){if(connected)try{await client.query('ROLLBACK')}catch{};const diagnostic=error.diagnostic?{...error.diagnostic,stage}:classifyPostgresError(error,stage);report=safeReport({sourceSha256:digest,restaurantId,validation:{...validation,diagnostics:[...validation.diagnostics,diagnostic]},dryRun,confirmedLegacySalesCurrency});writeReport();const safeError=new Error(diagnostic.code);safeError.diagnostic=diagnostic;throw safeError}
   finally{if(connected)await client.end().catch(()=>{})}
 }
 
@@ -468,5 +517,5 @@ function parseArgs(args){const result={};for(let i=0;i<args.length;i++){const ke
 
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){
   try{const args=parseArgs(process.argv.slice(2));const report=await runSqlitePostgresImport({sourcePath:args.source,activePath:args['active-db'],reportPath:args.report,restaurantId:args['restaurant-id'],confirmedLegacySalesCurrency:args['confirmed-sales-currency'],dryRun:Boolean(args.dryRun)});console.log(JSON.stringify({status:report.status,sourceCounts:report.sourceCounts,diagnostics:report.diagnostics,reportPath:path.resolve(args.report)}));if(report.status==='blocked')process.exitCode=2}
-  catch(error){console.error(/^[a-z0-9_]+$/.test(error.message||'')?error.message:'import_failed');process.exitCode=1}
+  catch(error){const diagnostic=error.diagnostic;if(diagnostic){const safe=Object.fromEntries(['code','stage','sqlstate','entity','id','constraint','table','column'].filter(key=>diagnostic[key]!=null).map(key=>[key,diagnostic[key]]));console.error(JSON.stringify(safe))}else console.error(/^[a-z0-9_]+$/.test(error.message||'')?error.message:'import_failed');process.exitCode=1}
 }

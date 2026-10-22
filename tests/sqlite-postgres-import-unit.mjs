@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { buildRows, hasAmbiguousJsonNumbers, readSnapshot, safeReport, validateImportPaths, validateState } from '../server/sqlite-postgres-import.mjs'
+import { buildRows, classifyPostgresError, hasAmbiguousJsonNumbers, insertOrder, readSnapshot, safeReport, validateImportPaths, validateRowMappings, validateState } from '../server/sqlite-postgres-import.mjs'
 
 const temp=fs.mkdtempSync(path.join(os.tmpdir(),'pos-p3-unit-'))
 try{
@@ -51,12 +51,29 @@ try{
   assert.equal(Object.hasOwn(snapshot.state.employees[0],'pin'),false)
   assert.equal(validation.counts.cashMovements,0)
   const built=buildRows('restaurant-test',snapshot.state,snapshot.credentials,validation,'COP')
+  assert.equal(validateRowMappings(built,insertOrder),true)
+  assert.deepEqual(Object.keys(built.rows).sort(),[...insertOrder].sort())
+  for(const [table,mapping] of Object.entries(built.rows))for(const [index,row] of mapping.data.entries())assert.equal(row.length,mapping.cols.length,`${table} row ${index} must match its declared insert columns`)
+  const emptyMappings={rows:Object.fromEntries(Object.entries(built.rows).map(([table,mapping])=>[table,{cols:mapping.cols,data:[]}])),idmap:[]}
+  assert.equal(validateRowMappings(emptyMappings,insertOrder),true,'empty collections retain a valid column mapping for every inserted table')
+  const malformed=structuredClone(built)
+  malformed.rows.sales.data[0].pop()
+  assert.throws(()=>validateRowMappings(malformed,insertOrder),error=>error.diagnostic?.code==='row_column_arity_mismatch'&&error.diagnostic.entity==='sales')
+  const missing={...built,rows:{...built.rows}}
+  delete missing.rows.payments
+  assert.throws(()=>validateRowMappings(missing,insertOrder),error=>error.diagnostic?.code==='missing_or_invalid_row_mapping'&&error.diagnostic.entity==='payments')
+  const classified=classifyPostgresError({code:'23503',constraint:'fk_orders_restaurant',table:'orders',column:'restaurant_id',message:'password=do-not-report query=INSERT secret'},'insert_orders')
+  assert.deepEqual(classified,{code:'postgres_foreign_key_violation',stage:'insert_orders',sqlstate:'23503',constraint:'fk_orders_restaurant',table:'orders',column:'restaurant_id'})
+  assert.doesNotMatch(JSON.stringify(classified),/do-not-report|secret|INSERT|password/)
+  assert.deepEqual(classifyPostgresError({code:'22012',message:'sensitive data'},'insert_payments'),{code:'postgres_sql_error',stage:'insert_payments',sqlstate:'22012'})
   assert.equal(built.rows.restaurant_tables.data[0][1],'17')
   assert.equal(built.rows.sale_orders.data[0][2],'order-A')
   assert.equal(built.rows.sale_lines.data[0][3],null,'sales use receipt snapshots without guessing order-line identity')
   assert.equal(built.rows.sale_lines.data[0][7],'5')
   assert.equal(built.rows.inventory_movements.data[0][4],'-10')
   assert.equal(built.rows.employee_credentials.data[0][4].length,32)
+  assert.equal(built.rows.product_recipe_versions.cols.at(-1),'created_by')
+  assert.equal(built.rows.product_recipe_versions.data[0].at(-1),null)
   assert.equal(built.rows.audit_events.data[0][6].includes('legacy_unverified'),true)
 
   const bad=structuredClone(snapshot.state)

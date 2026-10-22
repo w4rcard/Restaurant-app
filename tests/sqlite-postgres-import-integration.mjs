@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import pg from 'pg'
 import { runMigrations } from '../server/postgres-migrate.mjs'
-import { runSqlitePostgresImport } from '../server/sqlite-postgres-import.mjs'
+import { buildRows, insertOrder, runSqlitePostgresImport } from '../server/sqlite-postgres-import.mjs'
 
 const {Client}=pg
 const adminUrl=process.env.POSTGRES_INTEGRATION_TEST_URL
@@ -79,14 +79,26 @@ try{
   assert.deepEqual(await query(target.url,"SELECT employee_id,credential_state FROM employee_credentials WHERE restaurant_id=$1 ORDER BY employee_id",['restaurant-p3-test']).then(x=>x.rows.map(x=>[x.employee_id,x.credential_state])),[['emp-admin','active'],['emp-kitchen','reset_required'],['emp-waiter','must_change']])
   assert.deepEqual(await query(target.url,"SELECT order_id FROM sale_orders WHERE restaurant_id=$1 ORDER BY order_id",['restaurant-p3-test']).then(x=>x.rows.map(x=>x.order_id)),['order-A','order-B'])
   assert.equal((await query(target.url,"SELECT count(*)::int AS n FROM table_group_members WHERE restaurant_id=$1",['restaurant-p3-test'])).rows[0].n,2)
+  assert.deepEqual((await query(target.url,"SELECT product_id,version,created_by FROM product_recipe_versions WHERE restaurant_id=$1",['restaurant-p3-test'])).rows,[{product_id:'prod-soup',version:1,created_by:null}])
+  assert.deepEqual((await query(target.url,"SELECT count(*)::int AS n FROM payments WHERE restaurant_id=$1",['restaurant-p3-test'])).rows[0].n,2)
+  assert.deepEqual((await query(target.url,"SELECT id,order_number FROM orders WHERE restaurant_id=$1 ORDER BY id",['restaurant-p3-test'])).rows,[{id:'order-A',order_number:21},{id:'order-B',order_number:22}])
+  assert.deepEqual((await query(target.url,"SELECT ingredient_id,sale_id,quantity_delta::text FROM inventory_movements WHERE restaurant_id=$1",['restaurant-p3-test'])).rows,[{ingredient_id:'ing-flour',sale_id:'sale-A',quantity_delta:'-10'}])
   assert.equal((await query(target.url,"SELECT total::text FROM sales WHERE restaurant_id=$1 AND id='sale-A'",['restaurant-p3-test'])).rows[0].total,'9.6')
   assert.equal((await query(target.url,"SELECT sum(amount)::text AS total FROM payments WHERE restaurant_id=$1 AND sale_id='sale-A'",['restaurant-p3-test'])).rows[0].total,'9.6')
   assert.equal((await query(target.url,"SELECT status FROM legacy_import_runs WHERE restaurant_id=$1",['restaurant-p3-test'])).rows[0].status,'completed')
+  const manifestCounts=(await query(target.url,"SELECT imported_counts FROM legacy_import_runs WHERE restaurant_id=$1",['restaurant-p3-test'])).rows[0].imported_counts
+  for(const table of insertOrder){const actual=Number((await query(target.url,`SELECT count(*)::int AS n FROM public."${table}" WHERE restaurant_id=$1`,['restaurant-p3-test'])).rows[0].n);assert.equal(actual,Number(manifestCounts[table]||0),`committed target count for ${table} must match the accepted import manifest`)}
   assert.equal((await query(target.url,"SELECT count(*)::int AS n FROM audit_events WHERE details->>'provenance'='legacy_unverified'")).rows[0].n,1)
   const reportText=fs.readFileSync(source.reportPath,'utf8')
   assert.doesNotMatch(reportText,/12345678|password_hash|salt|Synthetic Customer|fixture@example/)
   await assert.rejects(importFixture({...source,restaurantId:'restaurant-p3-test',connectionString:target.url}),/postgres_target_must_be_empty/)
   assert.deepEqual(await countRows(target.url),{restaurants:1,employees:3,sales:1,imports:1},'rerun must not duplicate accepted records')
+
+  const malformedTarget=await createTarget(),malformedSource=sourcePaths('malformed-mapping')
+  const malformedMapping=await importFixture({...malformedSource,restaurantId:'malformed-map-test',connectionString:malformedTarget.url,rowBuilder:(...args)=>{const built=buildRows(...args);built.rows.sales.data[0].pop();return built}})
+  assert.equal(malformedMapping.status,'blocked')
+  assert.ok(malformedMapping.diagnostics.some(item=>item.code==='row_column_arity_mismatch'&&item.entity==='sales'))
+  assert.deepEqual(await countRows(malformedTarget.url),{restaurants:0,employees:0,sales:0,imports:0},'malformed mappings must be blocked before target transaction writes')
 
   const overlapSource=sourcePaths('overlap',fixture({overlap:true}))
   const blocked=await importFixture({...overlapSource,restaurantId:'blocked-test',dryRun:true,connectionString:target.url})
@@ -103,7 +115,11 @@ try{
 
   const rollbackTarget=await createTarget(),rollbackSource=sourcePaths('rollback')
   class FailingClient extends Client { async query(sql,...args){const result=await super.query(sql,...args);if(typeof sql==='string'&&sql.includes('INSERT INTO public.legacy_import_runs'))await super.query('SELECT 1/0');return result} }
-  await assert.rejects(importFixture({...rollbackSource,restaurantId:'rollback-test',connectionString:rollbackTarget.url,pgClient:FailingClient}),/postgres_import_failed/)
+  await assert.rejects(importFixture({...rollbackSource,restaurantId:'rollback-test',connectionString:rollbackTarget.url,pgClient:FailingClient}),/postgres_sql_error/)
+  const rollbackDiagnostic=JSON.parse(fs.readFileSync(rollbackSource.reportPath,'utf8')).diagnostics.at(-1)
+  assert.equal(rollbackDiagnostic.stage,'manifest')
+  assert.equal(rollbackDiagnostic.sqlstate,'22012')
+  assert.doesNotMatch(JSON.stringify(rollbackDiagnostic),/SELECT|password|secret|Fixture/)
   assert.deepEqual(await countRows(rollbackTarget.url),{restaurants:0,employees:0,sales:0,imports:0},'database error after inserts must roll back all imported rows')
 
   const interruptedTarget=await createTarget(),interruptedSource=sourcePaths('interrupted')
